@@ -1,0 +1,12 @@
+{
+  "name": "horse-rate-limit",
+  "description": "Rate Limiting middleware for Horse web framework",
+  "version": "1.0.0",
+  "homepage": "https://github.com/regyssilveira/horse-rate-limit",
+  "license": "MIT",
+  "mainsrc": "src/",
+  "browsingpath": "src/",
+  "dependencies": {
+    "github.com/HashLoad/horse": ">=3.1.100"
+  }
+}

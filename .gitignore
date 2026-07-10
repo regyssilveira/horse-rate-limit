@@ -1,0 +1,24 @@
+# Binários e arquivos gerados pelo compilador Delphi
+*.exe
+*.dll
+*.dcu
+*.dcp
+*.bpl
+*.o
+*.ppu
+*.map
+*.drc
+
+# Arquivos de configurações locais da IDE Delphi/Lazarus
+__recovery/
+*.identcache
+*.local
+*.stat
+*.tds
+*.otares
+*.cfg
+*.~*
+
+# Arquivos temporários do Boss
+modules/
+boss-lock.json
