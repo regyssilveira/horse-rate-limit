@@ -22,3 +22,6 @@ __recovery/
 # Arquivos temporários do Boss
 modules/
 boss-lock.json
+
+# Resultados de testes
+dunitx-results.xml
