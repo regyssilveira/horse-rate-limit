@@ -492,7 +492,7 @@ begin
       LClientIP := '';
       if LConfig.FTrustProxy then
       begin
-        LClientIP := Req.RawWebRequest.GetFieldByName(LConfig.FProxyHeader);
+        LClientIP := string(Req.RawWebRequest.GetFieldByName(AnsiString(LConfig.FProxyHeader)));
         if LClientIP <> '' then
         begin
           if LClientIP.Contains(',') then
@@ -500,7 +500,7 @@ begin
         end;
       end;
       if LClientIP = '' then
-        LClientIP := Req.RawWebRequest.RemoteAddr;
+        LClientIP := string(Req.RawWebRequest.RemoteAddr);
 
       // 2. Verificar Whitelist (Suporte a faixas CIDR)
       if Length(LConfig.FWhitelist) > 0 then
@@ -549,7 +549,7 @@ begin
         LKey := LConfig.FKeyGenerator(Req)
       else
       begin
-        LKey := Req.RawWebRequest.Method + ':' + Req.RawWebRequest.PathInfo + ':' + LClientIP;
+        LKey := string(Req.RawWebRequest.Method) + ':' + string(Req.RawWebRequest.PathInfo) + ':' + LClientIP;
       end;
 
       // Avaliação da taxa
@@ -578,8 +578,8 @@ begin
           LMetricInfo.Remaining := LInfo.Remaining;
           LMetricInfo.ResetTime := LInfo.ResetTime;
           LMetricInfo.IsBlocked := LInfo.IsBlocked;
-          LMetricInfo.Path := Req.RawWebRequest.PathInfo;
-          LMetricInfo.Method := Req.RawWebRequest.Method;
+          LMetricInfo.Path := string(Req.RawWebRequest.PathInfo);
+          LMetricInfo.Method := string(Req.RawWebRequest.Method);
           LConfig.FOnMetricsReport(LMetricInfo);
         except
           // Silencia para não quebrar a requisição ativa

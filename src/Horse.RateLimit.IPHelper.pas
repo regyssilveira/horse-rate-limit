@@ -48,7 +48,6 @@ end;
 function ParseIPv6(const AIP: string; out AIPBytes: TIPv6Bytes): Boolean;
 var
   LCleanIP: string;
-  LSplit: TArray<string>;
   LLeftParts, LRightParts: TArray<string>;
   LFinalParts: TArray<string>;
   I, J, LCount, LMissing: Integer;
