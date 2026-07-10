@@ -3,6 +3,27 @@
 Middleware de controle de limite de requisições (*Rate Limiting*) para o framework **Horse**. 
 Projetado para ser de alta performance, thread-safe, com suporte a armazenamento distribuído (Redis), limpeza assíncrona em background e compatível tanto com Delphi quanto com Lazarus/Free Pascal (FPC).
 
+---
+
+## 🚀 Recursos e Comparativo de Ecossistemas
+
+O **Horse Rate Limit** foi desenvolvido seguindo as melhores práticas e padrões arquiteturais das plataformas web mais robustas do mercado moderno. Veja abaixo como ele se compara com as soluções de referência em outros ecossistemas:
+
+| Funcionalidade | Express Rate Limit (Node.js) | ASP.NET Core (C# / .NET) | **Horse Rate Limit (Delphi/FPC)** |
+| :--- | :---: | :---: | :---: |
+| **Algoritmo de Janela Fixa** | Sim | Sim | **Sim** |
+| **Algoritmo de Janela Deslizante** | Sim | Sim | **Sim** (Sliding Window Counter) |
+| **Armazenamento Distribuído (Redis)** | Sim | Sim | **Sim** (Lua atômico e desacoplado) |
+| **Prevenção de IP Spoofing (Trust Proxy)** | Sim | Não nativo | **Sim** (com `ProxyHeader` customizável) |
+| **Bypass Dinâmico (Skip)** | Sim | Sim | **Sim** (via `SkipWhen`) |
+| **Listas de IP (Whitelist / Blacklist)** | Sim (via addons) | Não nativo | **Sim** (com suporte a **notação CIDR**) |
+| **Ocultação e Renomeação de Headers** | Sim | Sim | **Sim** (via `ExposeHeaders` e customizadores) |
+| **Erros Estruturados (responder em JSON)** | Sim | Sim | **Sim** (via callback `OnError`) |
+| **Telemetria / APM Hooks** | Sim | Sim | **Sim** (via callback `OnMetricsReport`) |
+| **Cleanup Assíncrono (Thread-safety)** | Nativo | Nativo | **Sim** (via `TCleanupThread` em background) |
+
+---
+
 ## ⚙️ Instalação
 
 A instalação é simples e feita usando o gerenciador de pacotes [`boss`](https://github.com/HashLoad/boss):
