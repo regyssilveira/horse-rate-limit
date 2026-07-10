@@ -3,7 +3,8 @@ unit Tests.Integration.RateLimit;
 interface
 
 uses
-  DUnitX.TestFramework, Horse, Horse.Commons, Horse.RateLimit, Horse.RateLimit.Storage.Redis, RESTRequest4D,
+  DUnitX.TestFramework, Horse, Horse.Commons, Horse.RateLimit, Horse.RateLimit.Storage.Redis,
+  Horse.RateLimit.IPHelper, RESTRequest4D,
   System.SysUtils, System.Classes, System.Threading, System.SyncObjs, System.DateUtils,
   Tests.CleanupHelper;
 
@@ -38,7 +39,21 @@ type
     procedure TestCustomErrorJSON;
     [Test]
     procedure TestRedisStorageMock;
+    
+    // Novos testes da Fase 2
+    [Test]
+    procedure TestCIDRSubnetValidation;
+    [Test]
+    procedure TestHiddenHeaders;
+    [Test]
+    procedure TestCustomHeaders;
+    [Test]
+    procedure TestMetricsReport;
   end;
+
+var
+  GMetricReported: Boolean = False;
+  GMetricClientIP: string = '';
 
 implementation
 
@@ -122,7 +137,7 @@ begin
       Res.Send('OK');
     end);
 
-  // Rota 6: Whitelist e Blacklist
+  // Rota 6: Whitelist e Blacklist (suporta múltiplos loopbacks locais)
   THorse.Get('/limit/whitelist-blacklist',
     [THorseRateLimit.New(
       THorseRateLimitConfig.Default
@@ -136,7 +151,7 @@ begin
       Res.Send('OK');
     end);
 
-  // Rota 7: SkipWhen
+  // Rota 7: SkipWhen (Bypass seguro e robusto)
   THorse.Get('/limit/skip',
     [THorseRateLimit.New(
       THorseRateLimitConfig.Default
@@ -189,6 +204,52 @@ begin
             Res.Status(THTTPStatus.TooManyRequests)
               .RawWebResponse.ContentType := 'application/json';
             Res.Send('{"error":"custom_rate_limit_exceeded","limit":' + Info.Limit.ToString + '}');
+          end)
+    )],
+    procedure(Req: THorseRequest; Res: THorseResponse)
+    begin
+      Res.Send('OK');
+    end);
+
+  // Rota 10: Ocultação de Headers (ExposeHeaders = False)
+  THorse.Get('/limit/hidden-headers',
+    [THorseRateLimit.New(
+      THorseRateLimitConfig.Default
+        .Limit(2)
+        .WindowSeconds(5)
+        .ExposeHeaders(False)
+    )],
+    procedure(Req: THorseRequest; Res: THorseResponse)
+    begin
+      Res.Send('OK');
+    end);
+
+  // Rota 11: Renomeação de Headers
+  THorse.Get('/limit/custom-headers',
+    [THorseRateLimit.New(
+      THorseRateLimitConfig.Default
+        .Limit(2)
+        .WindowSeconds(5)
+        .HeaderLimitName('Limit-Total')
+        .HeaderRemainingName('Limit-Restante')
+        .HeaderResetName('Limit-Zerar')
+    )],
+    procedure(Req: THorseRequest; Res: THorseResponse)
+    begin
+      Res.Send('OK');
+    end);
+
+  // Rota 12: Telemetria de Métricas
+  THorse.Get('/limit/metrics',
+    [THorseRateLimit.New(
+      THorseRateLimitConfig.Default
+        .Limit(5)
+        .WindowSeconds(5)
+        .OnMetricsReport(
+          procedure(const Info: THorseRateLimitMetricInfo)
+          begin
+            GMetricReported := True;
+            GMetricClientIP := Info.ClientIP;
           end)
     )],
     procedure(Req: THorseRequest; Res: THorseResponse)
@@ -391,8 +452,7 @@ var
 begin
   LReq := TRequest.New;
 
-  // Como o teste roda em localhost (127.0.0.1), ele está na Whitelist da rota
-  // Mesmo excedendo o limite de 1 requisição, deve continuar passando
+  // Como o teste roda em localhost (127.0.0.1 ou ::1), ele está na Whitelist da rota
   LRes := LReq.BaseURL(Format('http://localhost:%d/limit/whitelist-blacklist', [TEST_PORT])).Get;
   Assert.AreEqual(200, LRes.StatusCode);
 
@@ -418,7 +478,7 @@ begin
     .Get;
   Assert.AreEqual(200, LRes.StatusCode, 'Deveria pular o limite devido ao SkipWhen');
 
-  // Sem o cabeçalho, deve bater no limite após a 1a requisição
+  // Sem o cabeçalho, deve bater no limite após a 1a requisição (reinstanciando LReq para limpar os headers)
   LReq := TRequest.New;
   LRes := LReq.BaseURL(Format('http://localhost:%d/limit/skip', [TEST_PORT])).Get;
   Assert.AreEqual(200, LRes.StatusCode);
@@ -434,14 +494,12 @@ var
 begin
   LReq := TRequest.New;
 
-  // Rota com limite de 2 reqs, confiando no proxy. Usando IPs virtuais diferentes nos cabeçalhos:
   LRes := LReq.BaseURL(Format('http://localhost:%d/limit/trust-proxy', [TEST_PORT]))
     .AddHeader('X-Custom-Client-IP', '10.0.0.1')
     .Get;
   Assert.AreEqual(200, LRes.StatusCode);
   Assert.AreEqual('1', LRes.Headers.Values['X-RateLimit-Remaining']);
 
-  // Um IP diferente deve ter limite isolado e não gastar o do anterior
   LRes := LReq.BaseURL(Format('http://localhost:%d/limit/trust-proxy', [TEST_PORT]))
     .AddHeader('X-Custom-Client-IP', '10.0.0.2')
     .Get;
@@ -456,11 +514,9 @@ var
 begin
   LReq := TRequest.New;
 
-  // 1a requisição passa
   LRes := LReq.BaseURL(Format('http://localhost:%d/limit/custom-error-json', [TEST_PORT])).Get;
   Assert.AreEqual(200, LRes.StatusCode);
 
-  // 2a requisição bloqueada
   LRes := LReq.BaseURL(Format('http://localhost:%d/limit/custom-error-json', [TEST_PORT])).Get;
   Assert.AreEqual(429, LRes.StatusCode);
   Assert.AreEqual('application/json', LRes.Headers.Values['Content-Type']);
@@ -482,21 +538,76 @@ begin
     begin
       LEvalCalled := True;
       Assert.AreEqual('test-key', AKeys[0]);
-      Assert.AreEqual('10', AArgs[0]); // Limit
-      Assert.AreEqual('60', AArgs[1]); // WindowSeconds
+      Assert.AreEqual('10', AArgs[0]);
+      Assert.AreEqual('60', AArgs[1]);
       
       SetLength(LRet, 3);
-      LRet[0] := '5'; // Count
-      LRet[1] := '45'; // TTL
-      LRet[2] := '0'; // IsBlocked
+      LRet[0] := '5';
+      LRet[1] := '45';
+      LRet[2] := '0';
       Result := LRet;
     end);
 
   LInfo := LStorage.EvaluateEx('test-key', 10, 60, rlaFixedWindow);
   
   Assert.IsTrue(LEvalCalled, 'O callback do Redis Eval deveria ter sido chamado');
-  Assert.AreEqual(5, LInfo.Remaining, 'Deveria restar 5 requisicoes de limite (10 - 5 = 5)');
-  Assert.IsFalse(LInfo.IsBlocked, 'Nao deveria estar bloqueado');
+  Assert.AreEqual(5, LInfo.Remaining);
+  Assert.IsFalse(LInfo.IsBlocked);
+end;
+
+procedure TTestIntegrationRateLimit.TestCIDRSubnetValidation;
+begin
+  // IPv4
+  Assert.IsTrue(IsIPInCIDR('192.168.1.50', '192.168.1.0/24'));
+  Assert.IsTrue(IsIPInCIDR('10.0.0.12', '10.0.0.0/8'));
+  Assert.IsFalse(IsIPInCIDR('192.168.2.1', '192.168.1.0/24'));
+  
+  // IPv6
+  Assert.IsTrue(IsIPInCIDR('fe80::1', 'fe80::/10'));
+  Assert.IsTrue(IsIPInCIDR('::1', '::1/128'));
+  Assert.IsFalse(IsIPInCIDR('2001:db8::1', 'fe80::/10'));
+end;
+
+procedure TTestIntegrationRateLimit.TestHiddenHeaders;
+var
+  LReq: IRequest;
+  LRes: IResponse;
+begin
+  LReq := TRequest.New;
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/hidden-headers', [TEST_PORT])).Get;
+  Assert.AreEqual(200, LRes.StatusCode);
+  Assert.IsEmpty(LRes.Headers.Values['X-RateLimit-Limit']);
+  Assert.IsEmpty(LRes.Headers.Values['X-RateLimit-Remaining']);
+end;
+
+procedure TTestIntegrationRateLimit.TestCustomHeaders;
+var
+  LReq: IRequest;
+  LRes: IResponse;
+begin
+  LReq := TRequest.New;
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/custom-headers', [TEST_PORT])).Get;
+  Assert.AreEqual(200, LRes.StatusCode);
+  Assert.AreEqual('2', LRes.Headers.Values['Limit-Total']);
+  Assert.AreEqual('1', LRes.Headers.Values['Limit-Restante']);
+  Assert.IsNotEmpty(LRes.Headers.Values['Limit-Zerar']);
+end;
+
+procedure TTestIntegrationRateLimit.TestMetricsReport;
+var
+  LReq: IRequest;
+  LRes: IResponse;
+begin
+  GMetricReported := False;
+  GMetricClientIP := '';
+  
+  LReq := TRequest.New;
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/metrics', [TEST_PORT])).Get;
+  Assert.AreEqual(200, LRes.StatusCode);
+  
+  Sleep(150); // Aguarda o disparo
+  Assert.IsTrue(GMetricReported, 'O evento de metricas deveria ter sido disparado');
+  Assert.IsNotEmpty(GMetricClientIP, 'O IP nas metricas nao deveria estar vazio');
 end;
 
 initialization

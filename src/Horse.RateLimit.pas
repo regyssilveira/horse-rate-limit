@@ -25,11 +25,23 @@ type
     IsBlocked: Boolean;
   end;
 
+  THorseRateLimitMetricInfo = record
+    Key: string;
+    ClientIP: string;
+    Limit: Integer;
+    Remaining: Integer;
+    ResetTime: TDateTime;
+    IsBlocked: Boolean;
+    Path: string;
+    Method: string;
+  end;
+
   TKeyGeneratorProc = {$IF DEFINED(FPC)}TFunc<THorseRequest, string>{$ELSE}reference to function(Req: THorseRequest): string{$ENDIF};
   TSkipProc = {$IF DEFINED(FPC)}TFunc<THorseRequest, Boolean>{$ELSE}reference to function(Req: THorseRequest): Boolean{$ENDIF};
   TOnLimitReachedProc = {$IF DEFINED(FPC)}procedure(Req: THorseRequest; Res: THorseResponse; const Info: THorseRateLimitInfo){$ELSE}reference to procedure(Req: THorseRequest; Res: THorseResponse; const Info: THorseRateLimitInfo){$ENDIF};
   TOnErrorProc = {$IF DEFINED(FPC)}procedure(Req: THorseRequest; Res: THorseResponse; const Info: THorseRateLimitInfo; const ErrorMsg: string){$ELSE}reference to procedure(Req: THorseRequest; Res: THorseResponse; const Info: THorseRateLimitInfo; const ErrorMsg: string){$ENDIF};
   TOnCleanupErrorProc = {$IF DEFINED(FPC)}procedure(E: Exception){$ELSE}reference to procedure(E: Exception){$ENDIF};
+  TOnMetricsReportProc = {$IF DEFINED(FPC)}procedure(const Info: THorseRateLimitMetricInfo){$ELSE}reference to procedure(const Info: THorseRateLimitMetricInfo){$ENDIF};
 
   IHorseRateLimitStorage = interface
     ['{620F9CC2-4A3C-4C7C-BA80-7C000674C783}']
@@ -79,6 +91,11 @@ type
     FOnLimitReached: TOnLimitReachedProc;
     FOnError: TOnErrorProc;
     FOnCleanupError: TOnCleanupErrorProc;
+    FExposeHeaders: Boolean;
+    FHeaderLimitName: string;
+    FHeaderRemainingName: string;
+    FHeaderResetName: string;
+    FOnMetricsReport: TOnMetricsReportProc;
   public
     class function Default: THorseRateLimitConfig; static;
     function Limit(ALimit: Integer): THorseRateLimitConfig;
@@ -95,6 +112,11 @@ type
     function OnLimitReached(AProc: TOnLimitReachedProc): THorseRateLimitConfig;
     function OnError(AProc: TOnErrorProc): THorseRateLimitConfig;
     function OnCleanupError(AProc: TOnCleanupErrorProc): THorseRateLimitConfig;
+    function ExposeHeaders(AExpose: Boolean): THorseRateLimitConfig;
+    function HeaderLimitName(const AName: string): THorseRateLimitConfig;
+    function HeaderRemainingName(const AName: string): THorseRateLimitConfig;
+    function HeaderResetName(const AName: string): THorseRateLimitConfig;
+    function OnMetricsReport(AProc: TOnMetricsReportProc): THorseRateLimitConfig;
   end;
 
   THorseRateLimit = class
@@ -107,6 +129,9 @@ type
   end;
 
 implementation
+
+uses
+  Horse.RateLimit.IPHelper;
 
 type
   TCleanupThread = class(TThread)
@@ -139,7 +164,7 @@ begin
         try
           FStorage.FOnCleanupError(E);
         except
-          // Silencia para não quebrar a thread secundária caso o próprio callback lance exceção
+          // Silencia para não quebrar a thread secundária
         end;
       end;
     end;
@@ -179,7 +204,6 @@ var
 begin
   LNow := Now;
   
-  // Limpeza assíncrona de itens expirados a cada 5 minutos
   FLock.Acquire;
   try
     if MinutesBetween(LNow, FLastCleanup) >= 5 then
@@ -219,7 +243,6 @@ begin
 
     if AAlgorithm = rlaSlidingWindow then
     begin
-      // Calcula a estimativa da janela deslizante
       LTimePassed := SecondsBetween(LInfo.ResetTime, LNow);
       if LTimePassed > AWindowSeconds then
         LTimePassed := AWindowSeconds;
@@ -295,6 +318,11 @@ begin
   Result.FOnLimitReached := nil;
   Result.FOnError := nil;
   Result.FOnCleanupError := nil;
+  Result.FExposeHeaders := True;
+  Result.FHeaderLimitName := 'X-RateLimit-Limit';
+  Result.FHeaderRemainingName := 'X-RateLimit-Remaining';
+  Result.FHeaderResetName := 'X-RateLimit-Reset';
+  Result.FOnMetricsReport := nil;
 end;
 
 function THorseRateLimitConfig.Limit(ALimit: Integer): THorseRateLimitConfig;
@@ -309,6 +337,7 @@ begin
   Result.FWindowSeconds := AWindowSeconds;
 end;
 
+// Mapeamentos fluentes existentes
 function THorseRateLimitConfig.Storage(const AStorage: IHorseRateLimitStorage): THorseRateLimitConfig;
 begin
   Result := Self;
@@ -381,6 +410,37 @@ begin
   Result.FOnCleanupError := AProc;
 end;
 
+// Novos mapeamentos fluentes
+function THorseRateLimitConfig.ExposeHeaders(AExpose: Boolean): THorseRateLimitConfig;
+begin
+  Result := Self;
+  Result.FExposeHeaders := AExpose;
+end;
+
+function THorseRateLimitConfig.HeaderLimitName(const AName: string): THorseRateLimitConfig;
+begin
+  Result := Self;
+  Result.FHeaderLimitName := AName;
+end;
+
+function THorseRateLimitConfig.HeaderRemainingName(const AName: string): THorseRateLimitConfig;
+begin
+  Result := Self;
+  Result.FHeaderRemainingName := AName;
+end;
+
+function THorseRateLimitConfig.HeaderResetName(const AName: string): THorseRateLimitConfig;
+begin
+  Result := Self;
+  Result.FHeaderResetName := AName;
+end;
+
+function THorseRateLimitConfig.OnMetricsReport(AProc: TOnMetricsReportProc): THorseRateLimitConfig;
+begin
+  Result := Self;
+  Result.FOnMetricsReport := AProc;
+end;
+
 { THorseRateLimit }
 
 class constructor THorseRateLimit.CreateClass;
@@ -419,6 +479,7 @@ begin
       LResetSecs: Int64;
       LRetryAfter: Int64;
       LIP: string;
+      LMetricInfo: THorseRateLimitMetricInfo;
     begin
       // 1. Verificar regras de bypass/skip dinâmico
       if Assigned(LConfig.FSkipProc) and LConfig.FSkipProc(Req) then
@@ -441,12 +502,20 @@ begin
       if LClientIP = '' then
         LClientIP := Req.RawWebRequest.RemoteAddr;
 
-      // 2. Verificar Whitelist
+      // 2. Verificar Whitelist (Suporte a faixas CIDR)
       if Length(LConfig.FWhitelist) > 0 then
       begin
         for LIP in LConfig.FWhitelist do
         begin
-          if LIP = LClientIP then
+          if LIP.Contains('/') then
+          begin
+            if IsIPInCIDR(LClientIP, LIP) then
+            begin
+              Next();
+              Exit;
+            end;
+          end
+          else if LIP = LClientIP then
           begin
             Next();
             Exit;
@@ -454,12 +523,20 @@ begin
         end;
       end;
 
-      // 3. Verificar Blacklist
+      // 3. Verificar Blacklist (Suporte a faixas CIDR)
       if Length(LConfig.FBlacklist) > 0 then
       begin
         for LIP in LConfig.FBlacklist do
         begin
-          if LIP = LClientIP then
+          if LIP.Contains('/') then
+          begin
+            if IsIPInCIDR(LClientIP, LIP) then
+            begin
+              Res.Status(THTTPStatus.Forbidden).Send('IP Blocked');
+              raise EHorseCallbackInterrupted.Create;
+            end;
+          end
+          else if LIP = LClientIP then
           begin
             Res.Status(THTTPStatus.Forbidden).Send('IP Blocked');
             raise EHorseCallbackInterrupted.Create;
@@ -472,7 +549,6 @@ begin
         LKey := LConfig.FKeyGenerator(Req)
       else
       begin
-        // Diferencia por método HTTP e Path
         LKey := Req.RawWebRequest.Method + ':' + Req.RawWebRequest.PathInfo + ':' + LClientIP;
       end;
 
@@ -482,12 +558,33 @@ begin
       else
         LInfo := LStorage.Evaluate(LKey, LConfig.FLimit, LConfig.FWindowSeconds);
 
-      Res.AddHeader('X-RateLimit-Limit', LInfo.Limit.ToString);
-      Res.AddHeader('X-RateLimit-Remaining', LInfo.Remaining.ToString);
-      
-      // Unix Epoch Timestamp para o reset
-      LResetSecs := DateTimeToUnix(LInfo.ResetTime, False);
-      Res.AddHeader('X-RateLimit-Reset', LResetSecs.ToString);
+      // Inclusão de cabeçalhos de resposta customizados ou padrão
+      if LConfig.FExposeHeaders then
+      begin
+        Res.AddHeader(LConfig.FHeaderLimitName, LInfo.Limit.ToString);
+        Res.AddHeader(LConfig.FHeaderRemainingName, LInfo.Remaining.ToString);
+        
+        LResetSecs := DateTimeToUnix(LInfo.ResetTime, False);
+        Res.AddHeader(LConfig.FHeaderResetName, LResetSecs.ToString);
+      end;
+
+      // Telemetria de Métricas
+      if Assigned(LConfig.FOnMetricsReport) then
+      begin
+        try
+          LMetricInfo.Key := LKey;
+          LMetricInfo.ClientIP := LClientIP;
+          LMetricInfo.Limit := LInfo.Limit;
+          LMetricInfo.Remaining := LInfo.Remaining;
+          LMetricInfo.ResetTime := LInfo.ResetTime;
+          LMetricInfo.IsBlocked := LInfo.IsBlocked;
+          LMetricInfo.Path := Req.RawWebRequest.PathInfo;
+          LMetricInfo.Method := Req.RawWebRequest.Method;
+          LConfig.FOnMetricsReport(LMetricInfo);
+        except
+          // Silencia para não quebrar a requisição ativa
+        end;
+      end;
 
       if LInfo.IsBlocked then
       begin
@@ -501,7 +598,7 @@ begin
           try
             LConfig.FOnLimitReached(Req, Res, LInfo);
           except
-            // Silencia para não interromper a resposta do erro em si
+            // Silencia
           end;
         end;
 
