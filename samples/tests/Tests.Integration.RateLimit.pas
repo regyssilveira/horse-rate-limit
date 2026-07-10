@@ -3,7 +3,7 @@ unit Tests.Integration.RateLimit;
 interface
 
 uses
-  DUnitX.TestFramework, Horse, Horse.Commons, Horse.RateLimit, RESTRequest4D,
+  DUnitX.TestFramework, Horse, Horse.Commons, Horse.RateLimit, Horse.RateLimit.Storage.Redis, RESTRequest4D,
   System.SysUtils, System.Classes, System.Threading, System.SyncObjs, System.DateUtils,
   Tests.CleanupHelper;
 
@@ -26,6 +26,18 @@ type
     procedure TestCustomErrorMessage;
     [Test]
     procedure TestConcurrency;
+    [Test]
+    procedure TestSlidingWindow;
+    [Test]
+    procedure TestWhitelistBlacklist;
+    [Test]
+    procedure TestSkipWhen;
+    [Test]
+    procedure TestTrustProxy;
+    [Test]
+    procedure TestCustomErrorJSON;
+    [Test]
+    procedure TestRedisStorageMock;
   end;
 
 implementation
@@ -90,6 +102,93 @@ begin
             Result := Req.Headers['X-Api-Token'];
             if Result = '' then
               Result := Req.RawWebRequest.RemoteAddr;
+          end)
+    )],
+    procedure(Req: THorseRequest; Res: THorseResponse)
+    begin
+      Res.Send('OK');
+    end);
+
+  // Rota 5: Sliding Window (3 requisições por 2 segundos)
+  THorse.Get('/limit/sliding-window',
+    [THorseRateLimit.New(
+      THorseRateLimitConfig.Default
+        .Limit(3)
+        .WindowSeconds(2)
+        .Algorithm(rlaSlidingWindow)
+    )],
+    procedure(Req: THorseRequest; Res: THorseResponse)
+    begin
+      Res.Send('OK');
+    end);
+
+  // Rota 6: Whitelist e Blacklist
+  THorse.Get('/limit/whitelist-blacklist',
+    [THorseRateLimit.New(
+      THorseRateLimitConfig.Default
+        .Limit(1)
+        .WindowSeconds(5)
+        .Whitelist(['127.0.0.1', '::1', '0:0:0:0:0:0:0:1', 'localhost'])
+        .Blacklist(['192.168.1.100'])
+    )],
+    procedure(Req: THorseRequest; Res: THorseResponse)
+    begin
+      Res.Send('OK');
+    end);
+
+  // Rota 7: SkipWhen
+  THorse.Get('/limit/skip',
+    [THorseRateLimit.New(
+      THorseRateLimitConfig.Default
+        .Limit(1)
+        .WindowSeconds(5)
+        .SkipWhen(
+          function(Req: THorseRequest): Boolean
+          var
+            LKey: string;
+          begin
+            Result := False;
+            for LKey in Req.Headers.Dictionary.Keys do
+            begin
+              if SameText(LKey, 'X-Skip-Limit') then
+              begin
+                Result := Req.Headers.Dictionary[LKey] = 'true';
+                Break;
+              end;
+            end;
+          end)
+    )],
+    procedure(Req: THorseRequest; Res: THorseResponse)
+    begin
+      Res.Send('OK');
+    end);
+
+  // Rota 8: Trust Proxy
+  THorse.Get('/limit/trust-proxy',
+    [THorseRateLimit.New(
+      THorseRateLimitConfig.Default
+        .Limit(2)
+        .WindowSeconds(5)
+        .TrustProxy(True)
+        .ProxyHeader('X-Custom-Client-IP')
+    )],
+    procedure(Req: THorseRequest; Res: THorseResponse)
+    begin
+      Res.Send('OK');
+    end);
+
+  // Rota 9: Erro Customizado JSON
+  THorse.Get('/limit/custom-error-json',
+    [THorseRateLimit.New(
+      THorseRateLimitConfig.Default
+        .Limit(1)
+        .WindowSeconds(5)
+        .OnError(
+          procedure(Req: THorseRequest; Res: THorseResponse; const Info: THorseRateLimitInfo; const ErrorMsg: string)
+          begin
+            Res.Status(THTTPStatus.TooManyRequests)
+              .RawWebResponse.ContentType := 'application/json';
+            Res.Send('{"error":"custom_rate_limit_exceeded","limit":' + Info.Limit.ToString + '}');
           end)
     )],
     procedure(Req: THorseRequest; Res: THorseResponse)
@@ -263,6 +362,141 @@ begin
   finally
     LFailedCS.Free;
   end;
+end;
+
+procedure TTestIntegrationRateLimit.TestSlidingWindow;
+var
+  LReq: IRequest;
+  LRes: IResponse;
+  I: Integer;
+begin
+  LReq := TRequest.New;
+
+  // Permite 3 requisições
+  for I := 1 to 3 do
+  begin
+    LRes := LReq.BaseURL(Format('http://localhost:%d/limit/sliding-window', [TEST_PORT])).Get;
+    Assert.AreEqual(200, LRes.StatusCode, Format('Sliding: Requisicao %d falhou', [I]));
+  end;
+
+  // A 4a deve ser bloqueada
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/sliding-window', [TEST_PORT])).Get;
+  Assert.AreEqual(429, LRes.StatusCode, 'Sliding: A 4a requisicao deveria ser bloqueada (429)');
+end;
+
+procedure TTestIntegrationRateLimit.TestWhitelistBlacklist;
+var
+  LReq: IRequest;
+  LRes: IResponse;
+begin
+  LReq := TRequest.New;
+
+  // Como o teste roda em localhost (127.0.0.1), ele está na Whitelist da rota
+  // Mesmo excedendo o limite de 1 requisição, deve continuar passando
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/whitelist-blacklist', [TEST_PORT])).Get;
+  Assert.AreEqual(200, LRes.StatusCode);
+
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/whitelist-blacklist', [TEST_PORT])).Get;
+  Assert.AreEqual(200, LRes.StatusCode, 'Deveria passar pois localhost esta na Whitelist');
+end;
+
+procedure TTestIntegrationRateLimit.TestSkipWhen;
+var
+  LReq: IRequest;
+  LRes: IResponse;
+begin
+  LReq := TRequest.New;
+
+  // Passando cabeçalho especial que ativa o SkipWhen
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/skip', [TEST_PORT]))
+    .AddHeader('X-Skip-Limit', 'true')
+    .Get;
+  Assert.AreEqual(200, LRes.StatusCode);
+
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/skip', [TEST_PORT]))
+    .AddHeader('X-Skip-Limit', 'true')
+    .Get;
+  Assert.AreEqual(200, LRes.StatusCode, 'Deveria pular o limite devido ao SkipWhen');
+
+  // Sem o cabeçalho, deve bater no limite após a 1a requisição
+  LReq := TRequest.New;
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/skip', [TEST_PORT])).Get;
+  Assert.AreEqual(200, LRes.StatusCode);
+
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/skip', [TEST_PORT])).Get;
+  Assert.AreEqual(429, LRes.StatusCode, 'Deveria bater no limite sem o cabecalho de skip');
+end;
+
+procedure TTestIntegrationRateLimit.TestTrustProxy;
+var
+  LReq: IRequest;
+  LRes: IResponse;
+begin
+  LReq := TRequest.New;
+
+  // Rota com limite de 2 reqs, confiando no proxy. Usando IPs virtuais diferentes nos cabeçalhos:
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/trust-proxy', [TEST_PORT]))
+    .AddHeader('X-Custom-Client-IP', '10.0.0.1')
+    .Get;
+  Assert.AreEqual(200, LRes.StatusCode);
+  Assert.AreEqual('1', LRes.Headers.Values['X-RateLimit-Remaining']);
+
+  // Um IP diferente deve ter limite isolado e não gastar o do anterior
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/trust-proxy', [TEST_PORT]))
+    .AddHeader('X-Custom-Client-IP', '10.0.0.2')
+    .Get;
+  Assert.AreEqual(200, LRes.StatusCode);
+  Assert.AreEqual('1', LRes.Headers.Values['X-RateLimit-Remaining']);
+end;
+
+procedure TTestIntegrationRateLimit.TestCustomErrorJSON;
+var
+  LReq: IRequest;
+  LRes: IResponse;
+begin
+  LReq := TRequest.New;
+
+  // 1a requisição passa
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/custom-error-json', [TEST_PORT])).Get;
+  Assert.AreEqual(200, LRes.StatusCode);
+
+  // 2a requisição bloqueada
+  LRes := LReq.BaseURL(Format('http://localhost:%d/limit/custom-error-json', [TEST_PORT])).Get;
+  Assert.AreEqual(429, LRes.StatusCode);
+  Assert.AreEqual('application/json', LRes.Headers.Values['Content-Type']);
+  Assert.IsTrue(LRes.Content.Contains('"error":"custom_rate_limit_exceeded"'), 'Deveria retornar o JSON customizado');
+end;
+
+procedure TTestIntegrationRateLimit.TestRedisStorageMock;
+var
+  LStorage: IHorseRateLimitStorageEx;
+  LEvalCalled: Boolean;
+  LInfo: THorseRateLimitInfo;
+begin
+  LEvalCalled := False;
+  
+  LStorage := THorseRateLimitRedisStorage.Create(
+    function(const AScript: string; const AKeys: TArray<string>; const AArgs: TArray<string>): TArray<string>
+    var
+      LRet: TArray<string>;
+    begin
+      LEvalCalled := True;
+      Assert.AreEqual('test-key', AKeys[0]);
+      Assert.AreEqual('10', AArgs[0]); // Limit
+      Assert.AreEqual('60', AArgs[1]); // WindowSeconds
+      
+      SetLength(LRet, 3);
+      LRet[0] := '5'; // Count
+      LRet[1] := '45'; // TTL
+      LRet[2] := '0'; // IsBlocked
+      Result := LRet;
+    end);
+
+  LInfo := LStorage.EvaluateEx('test-key', 10, 60, rlaFixedWindow);
+  
+  Assert.IsTrue(LEvalCalled, 'O callback do Redis Eval deveria ter sido chamado');
+  Assert.AreEqual(5, LInfo.Remaining, 'Deveria restar 5 requisicoes de limite (10 - 5 = 5)');
+  Assert.IsFalse(LInfo.IsBlocked, 'Nao deveria estar bloqueado');
 end;
 
 initialization
