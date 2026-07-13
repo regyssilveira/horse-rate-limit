@@ -290,4 +290,4 @@ end.
 
 ## 📄 Licença
 
-Licenciado sob a licença [MIT](LICENSE).
+Este projeto está licenciado sob a [Apache License 2.0](LICENSE).
